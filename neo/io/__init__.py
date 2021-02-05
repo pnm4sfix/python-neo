@@ -323,9 +323,9 @@ iolist = [
     IntanIO,
     KlustaKwikIO,
     KwikIO,
-    MEArecIO,
     MicromedIO,
-    NixIO,  # place NixIO before other IOs that use HDF5 to make it the default for .h5 files
+    NixIO,  # place NixIO before NeoHdf5IO and MEArecIO to make it the default for .h5 files
+    MEArecIO,
     NeoMatlabIO,
     NestIO,
     NeuralynxIO,
@@ -353,10 +353,32 @@ iolist = [
 def get_io(filename, *args, **kwargs):
     """
     Return a Neo IO instance, guessing the type based on the filename suffix.
+
+    The first matching IO that is found will be returned.
+
+    See also: `get_compatible_io_classes`
     """
     extension = os.path.splitext(filename)[1][1:]
-    for io in iolist:
-        if extension in io.extensions:
-            return io(filename, *args, **kwargs)
+    for io_cls in iolist:
+        if extension in io_cls.extensions:
+            return io_cls(filename, *args, **kwargs)
 
     raise IOError("File extension %s not registered" % extension)
+
+
+def get_compatible_io_classes(filename, *args, **kwargs):
+    """
+    Return a list of all Neo IO instances that support the given filename extension.
+
+    """
+    compatible_ios = []
+    extension = os.path.splitext(filename)[1][1:]
+    for io_cls in iolist:
+        if extension in io_cls.extensions:
+            try:
+                io_obj = io_cls(filename, *args, **kwargs)
+            except Exception:
+                pass
+            else:
+                compatible_ios.append(io_obj)
+    return compatible_ios
