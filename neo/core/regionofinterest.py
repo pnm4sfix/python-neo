@@ -1,9 +1,32 @@
 from math import floor, ceil
+from neo.core.container import Container
+from neo.core.imagesequence import ImageSequence
 
 
-class RegionOfInterest:
+class RegionOfInterest(Container):
     """Abstract base class"""
-    pass
+
+    _parent_objects = ('Group',)
+    _parent_attrs = ('group',)
+    _necessary_attrs = (
+        ('obj', ('ImageSequence', ), 1),
+    )
+
+    def __init__(self, obj, name=None, description=None, file_origin=None, **annotations):
+        super().__init__(name=name, description=description,
+                         file_origin=file_origin, **annotations)
+
+        if not (isinstance(obj, ImageSequence) or (
+                hasattr(obj, "proxy_for") and issubclass(obj.proxy_for, ImageSequence))):
+            raise ValueError("Can only take a RegionOfInterest of an ImageSequence")
+        self.obj = obj
+
+    def resolve(self):
+        """
+        Return a copy of the underlying ImageSequence that is referenced by the RegionOfInterest.
+        """
+        return self.obj.signal_from_region(self)
+
 
 
 class CircularRegionOfInterest(RegionOfInterest):
@@ -113,9 +136,15 @@ class PolygonRegionOfInterest(RegionOfInterest):
             of the vertices of the polygon
     """
 
-    def __init__(self, *vertices):
+    def __init__(self, vertices = None, obj = None, name = None, description = None,
+                 annotations = None):
         self.vertices = vertices
-
+        RegionOfInterest.__init__(self, obj = obj, name = name, 
+                                  description = description)
+        #self.name = name
+        #self.description = description
+        #self.annotations = annotations
+        
     def polygon_ray_casting(self, bounding_points, bounding_box_positions):
 
         # from https://stackoverflow.com/questions/217578/how-can-i-determine-whether-a-2d-point-is-within-a-polygon
