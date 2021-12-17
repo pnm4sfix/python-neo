@@ -292,6 +292,7 @@ class BaseNeo:
     def _repr_pretty_attrs_(self, pp, cycle):
         first = True
         for key in self._repr_pretty_attrs_keys_:
+            
             value = getattr(self, key)
             if value:
                 if first:
@@ -301,6 +302,7 @@ class BaseNeo:
                 with pp.group(indent=1):
                     pp.text("{}: ".format(key))
                     pp.pretty(value)
+            
 
     def _repr_pretty_(self, pp, cycle):
         """
