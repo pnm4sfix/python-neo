@@ -23,7 +23,24 @@ import numpy as np
 from neo.core.baseneo import BaseNeo
 from neo.core.basesignal import BaseSignal
 from neo.core.dataobject import DataObject
+from copy import copy, deepcopy
 
+
+def _get_sampling_rate(sampling_rate, sampling_period):
+    '''
+    Gets the sampling_rate from either the sampling_period or the
+    sampling_rate, or makes sure they match if both are specified
+    '''
+    if sampling_period is None:
+        if sampling_rate is None:
+            raise ValueError("You must provide either the sampling rate or " + "sampling period")
+    elif sampling_rate is None:
+        sampling_rate = 1.0 / sampling_period
+    elif sampling_period != 1.0 / sampling_rate:
+        raise ValueError('The sampling_rate has to be 1/sampling_period')
+    if not hasattr(sampling_rate, 'units'):
+        raise TypeError("Sampling rate/sampling period must have units")
+    return sampling_rate
 
 class ImageSequence(BaseSignal):
     """
@@ -99,7 +116,7 @@ class ImageSequence(BaseSignal):
 
     def __new__(cls, image_data, units=None, dtype=None, copy=True, t_start=0 * pq.s,
                 spatial_scale=None, frame_duration=None,
-                sampling_rate=None, name=None, description=None, file_origin=None,
+                sampling_rate=None, sampling_period=None, name=None, description=None, file_origin=None,
                 **annotations):
         """
         Constructs new :class:`ImageSequence` from data.
@@ -111,11 +128,16 @@ class ImageSequence(BaseSignal):
         """
         if spatial_scale is None:
             raise ValueError("spatial_scale is required")
-
-        image_data = np.stack(image_data)
-        if len(image_data.shape) != 3:
-            raise ValueError("list doesn't have the correct number of dimensions")
-
+        if type(image_data) == np.ndarray:
+            image_data = np.stack(image_data)
+            if len(image_data.shape) != 3:
+                raise ValueError("list doesn't have the correct number of dimensions")
+        
+        # added this as image data from time slice was dimensionless and caused rescale issues
+        elif type(image_data) == cls.__class__:
+            image_data = image_data.magnitude * units
+            
+        image_data = cls._rescale(image_data, units=units)
         obj = pq.Quantity(image_data, units=units, dtype=dtype, copy=copy).view(cls)
         obj.segment = None
         # function from analogsignal.py in neo/core directory
@@ -129,7 +151,7 @@ class ImageSequence(BaseSignal):
 
     def __init__(self, image_data, units=None, dtype=None, copy=True, t_start=0 * pq.s,
                  spatial_scale=None, frame_duration=None,
-                 sampling_rate=None, name=None, description=None, file_origin=None,
+                 sampling_rate=None, sampling_period= None, name=None, description=None, file_origin=None,
                  **annotations):
         """
         Initializes a newly constructed :class:`ImageSequence` instance.
@@ -137,6 +159,7 @@ class ImageSequence(BaseSignal):
         DataObject.__init__(
             self, name=name, file_origin=file_origin, description=description, **annotations
         )
+        
 
     def __array_finalize__spec(self, obj):
 
@@ -182,6 +205,61 @@ class ImageSequence(BaseSignal):
             )
 
         return analogsignal_list
+    
+    def __getitem__(self, i):
+        '''
+        Get the item or slice :attr:`i`.
+        '''
+        print(i)
+        if isinstance(i, (int, np.integer)):  # a single point in time across all channels
+            obj = super().__getitem__(i)
+            obj = pq.Quantity(obj.magnitude, units=obj.units)
+        elif isinstance(i, tuple):
+            obj = super().__getitem__(i)
+            j, k = i
+            if isinstance(j, (int, np.integer)):  # extract a quantity array
+                obj = pq.Quantity(obj.magnitude, units=obj.units)
+            else:
+                if isinstance(j, slice):
+                    if j.start:
+                        obj.t_start = (self.t_start + j.start * self.sampling_period)
+                    if j.step:
+                        obj.sampling_period *= j.step
+                elif isinstance(j, np.ndarray):
+                    raise NotImplementedError(
+                        "Arrays not yet supported")  # in the general case, would need to return
+                    #  IrregularlySampledSignal(Array)
+                else:
+                    raise TypeError("%s not supported" % type(j))
+                if isinstance(k, (int, np.integer)):
+                    obj = obj.reshape(-1, 1)
+                obj.array_annotate(**deepcopy(self.array_annotations_at_index(k)))
+        elif isinstance(i, slice):
+            obj = super().__getitem__(i)
+            
+            obj.sampling_rate = self.sampling_rate
+            obj.spatial_scale = self.spatial_scale
+            obj.sampling_period = self.sampling_period
+            if i.start:
+                obj.t_start = self.t_start + i.start * self.sampling_period
+                obj.sampling_rate = self.sampling_rate
+            obj.array_annotations = deepcopy(self.array_annotations)
+            
+        elif isinstance(i, np.ndarray):
+            # Indexing of an AnalogSignal is only consistent if the resulting number of
+            # samples is the same for each trace. The time axis for these samples is not
+            # guaranteed to be continuous, so returning a Quantity instead of an AnalogSignal here.
+            new_time_dims = np.sum(i, axis=0)
+            if len(new_time_dims) and all(new_time_dims == new_time_dims[0]):
+                obj = np.asarray(self).T.__getitem__(i.T)
+                obj = obj.T.reshape(self.shape[1], -1).T
+                obj = pq.Quantity(obj, units=self.units)
+            else:
+                raise IndexError("indexing of an AnalogSignals needs to keep the same number of "
+                                 "sample for each trace contained")
+        else:
+            raise IndexError("index should be an integer, tuple, slice or boolean numpy array")
+        return obj
 
     def _repr_pretty_(self, pp, cycle):
         """
@@ -219,6 +297,49 @@ class ImageSequence(BaseSignal):
             for attr in ("sampling_rate", "spatial_scale", "t_start"):
                 if getattr(self, attr) != getattr(other, attr):
                     raise ValueError("Inconsistent values of %s" % attr)
+                    
+    def time_index(self, t):
+        """Return the array index (or indices) corresponding to the time (or times) `t`"""
+        i = (t - self.t_start) * self.sampling_rate
+        i = np.rint(i.simplified.magnitude).astype(np.int64)
+        return i
+    
+    def time_slice(self, t_start, t_stop):
+        '''
+        Creates a new AnalogSignal corresponding to the time slice of the
+        original AnalogSignal between times t_start, t_stop. Note, that for
+        numerical stability reasons if t_start does not fall exactly on
+        the time bins defined by the sampling_period it will be rounded to
+        the nearest sampling bin. The time bin for t_stop will be chosen to
+        make the duration of the resultant signal as close as possible to
+        t_stop - t_start. This means that for a given duration, the size
+        of the slice will always be the same.
+        '''
+
+        # checking start time and transforming to start index
+        if t_start is None:
+            i = 0
+            t_start = 0 * pq.s
+        else:
+            i = self.time_index(t_start)
+
+        # checking stop time and transforming to stop index
+        if t_stop is None:
+            j = len(self)
+        else:
+            delta = (t_stop - t_start) * self.sampling_rate
+            j = i + int(np.rint(delta.simplified.magnitude))
+
+        if (i < 0) or (j > len(self)):
+            raise ValueError('t_start, t_stop have to be within the analog \
+                              signal duration')
+
+        # Time slicing should create a deep copy of the object
+        obj = deepcopy(self[i:j])
+
+        obj.t_start = self.t_start + i * self.sampling_period
+
+        return obj
 
     # t_start attribute is handled as a property so type checking can be done
     @property
@@ -283,3 +404,25 @@ class ImageSequence(BaseSignal):
         elif not hasattr(duration, "units"):
             raise ValueError("frame_duration must have units")
         self.sampling_rate = 1.0 / duration
+    
+    @property
+    def sampling_period(self):
+        '''
+        Interval between two samples.
+
+        (1/:attr:`sampling_rate`)
+        '''
+        return 1. / self.sampling_rate
+
+    @sampling_period.setter
+    def sampling_period(self, period):
+        '''
+        Setter for :attr:`sampling_period`
+        '''
+        if period is None:
+            raise ValueError('sampling_period cannot be None')
+        elif not hasattr(period, 'units'):
+            raise ValueError('sampling_period must have units')
+        self.sampling_rate = 1. / period
+    
+    
