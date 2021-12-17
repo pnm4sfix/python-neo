@@ -8,6 +8,7 @@ and :class:`Unit`.
 
 from os import close
 from neo.core.container import Container
+from neo.core.regionofinterest import PolygonRegionOfInterest
 
 
 class Group(Container):
@@ -39,9 +40,9 @@ class Group(Container):
     """
     _data_child_objects = (
         'AnalogSignal', 'IrregularlySampledSignal', 'SpikeTrain',
-        'Event', 'Epoch', 'ChannelView', 'ImageSequence'
+        'Event', 'Epoch', 'ChannelView', 'ImageSequence', 'RegionOfInterest'
     )
-    _container_child_objects = ('Segment', 'Group')
+    _container_child_objects = ('Segment', 'Group',)
     _parent_objects = ('Block',)
 
     def __init__(self, objects=None, name=None, description=None, file_origin=None,
@@ -73,7 +74,12 @@ class Group(Container):
             if self.allowed_types and not isinstance(obj, self.allowed_types):
                 raise TypeError("This Group can only contain {}, but not {}"
                                 "".format(self.allowed_types, type(obj)))
-            container = self._get_container(obj.__class__)
+            
+            # to add polygonroi we need to pass the base class region of interest
+            if obj.__class__ == PolygonRegionOfInterest:
+                container = self._get_container(obj.__class__.__bases__[0])
+            else:
+                container = self._get_container(obj.__class__)
             container.append(obj)
 
     def walk(self):
