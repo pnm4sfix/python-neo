@@ -35,7 +35,7 @@ import numpy as np
 from .baseio import BaseIO
 from ..core import (Block, Segment, AnalogSignal,
                     IrregularlySampledSignal, Epoch, Event, SpikeTrain,
-                    ImageSequence, ChannelView, Group)
+                    ImageSequence, ChannelView, Group, PolygonRegionOfInterest)
 from ..io.proxyobjects import BaseProxy
 from ..version import version as neover
 
@@ -212,6 +212,7 @@ class NixIO(BaseIO):
         self._ref_map = dict()
         self._signal_map = dict()
         self._view_map = dict()
+        self._roi_map = dict()
 
         # _names_ok is used to guard against name check duplication
         self._names_ok = False
@@ -403,7 +404,8 @@ class NixIO(BaseIO):
         dataarrays = list(filter(
             lambda da: da.type in ("neo.analogsignal",
                                    "neo.irregularlysampledsignal",
-                                   "neo.imagesequence",),
+                                   "neo.imagesequence",
+                                    "neo.regionofinterest"),
             nix_group.data_arrays))
         dataarrays = self._group_signals(dataarrays)
         # descend into DataArrays
@@ -414,10 +416,29 @@ class NixIO(BaseIO):
         for mtag in nix_group.multi_tags:
             if mtag.type == "neo.channelview" and mtag.name not in self._neo_map:
                 self._nix_to_neo_channelview(mtag)
+                
+            # elif mtag == neo.Polygoon.. - try dask with quantities
+            elif mtag.type == "neo.regionofinterest" and mtag.name not in self._neo_map:
+                self._nix_to_neo_regionofinterest(mtag)
+                
+                
             obj = self._neo_map[mtag.name]
+            # add roi not working because polygonroi not included
+            
             neo_group.add(obj)
 
         return neo_group, parent_name
+    
+    def _nix_to_neo_regionofinterest(self, nix_mtag):
+        neo_attrs = self._nix_attr_to_neo(nix_mtag)
+        # "nix_name" in attrs gives unexpexted keyword 
+        neo_attrs = {k:v for k, v in neo_attrs.items() if k!= "nix_name"}
+        vertices = nix_mtag.positions
+        nix_name, = self._group_signals(nix_mtag.references).keys()
+        obj = self._neo_map[nix_name]
+        neo_roi = PolygonRegionOfInterest(obj = obj, vertices = vertices, **neo_attrs)
+        self._neo_map[nix_mtag.name] = neo_roi
+        return neo_roi
 
     def _nix_to_neo_channelview(self, nix_mtag):
         neo_attrs = self._nix_attr_to_neo(nix_mtag)
@@ -482,6 +503,8 @@ class NixIO(BaseIO):
         metadata = nix_da_group[0].metadata
         neo_attrs["nix_name"] = metadata.name  # use the common base name
         unit = nix_da_group[0].unit
+        
+        # can we make a proxy object for this
         imgseq = np.array([d[:] for d in nix_da_group]).transpose()
 
         sampling_rate = neo_attrs["sampling_rate"]
@@ -651,6 +674,53 @@ class NixIO(BaseIO):
         # descend into Neo Groups
         for group in block.groups:
             self._write_group(group, nixblock)
+    
+    def _write_regionofinterest(self, roi, nixblock, nixgroup):
+        if "nix_name" in roi.annotations:
+            nix_name = roi.annotations["nix_name"]
+        else:
+            nix_name = "neo.regionofinterest.{}".format(self._generate_nix_name())
+            roi.annotate(nix_name=nix_name)
+        
+        # create a new data array if this roi was not saved yet - add roi_map
+        if not nix_name in self._roi_map:
+            vertices = nixblock.create_data_array(
+                "{}.index".format(nix_name), "neo.regionofinterest.vertices", data=roi.vertices
+            )
+        
+            nixmt = nixblock.create_multi_tag(nix_name, "neo.regionofinterest",
+                                                  positions=vertices)
+    
+            nixmt.metadata = nixgroup.metadata.create_section(
+                nix_name, "neo.regionofinterest.metadata"
+            )
+            metadata = nixmt.metadata
+            neoname = roi.name if roi.name is not None else ""
+            metadata["neo_name"] = neoname
+            nixmt.definition = roi.description
+        
+            if roi.annotations:
+                for k, v in roi.annotations.items():
+                    self._write_property(metadata, k, v)
+                self._roi_map[nix_name] = nixmt
+    
+            # link tag to the data array for the ChannelView's signal
+            if not ("nix_name" in roi.obj.annotations
+                    and roi.obj.annotations["nix_name"] in self._signal_map):
+                # the following restriction could be relaxed later
+                # but for a first pass this simplifies my mental model
+                raise Exception("Need to save signals before saving views")
+            nix_name = roi.obj.annotations["nix_name"]
+            nixmt.references.extend(self._signal_map[nix_name])
+        else:
+            nixmt = self._roi_map[nix_name]
+
+        nixgroup.multi_tags.append(nixmt)
+    
+    
+        
+        
+        
 
     def _write_channelview(self, chview, nixblock, nixgroup):
         """
@@ -743,9 +813,9 @@ class NixIO(BaseIO):
             self._write_epoch(epoch, nixblock, nixgroup)
         for spiketrain in segment.spiketrains:
             self._write_spiketrain(spiketrain, nixblock, nixgroup)
-
         for imagesequence in segment.imagesequences:
             self._write_imagesequence(imagesequence, nixblock, nixgroup)
+        
 
     def _write_group(self, neo_group, nixblock, parent=None):
         """
@@ -806,8 +876,10 @@ class NixIO(BaseIO):
         for obj in chain(
             neo_group.events,
             neo_group.epochs,
-            neo_group.spiketrains,
+            neo_group.spiketrains
         ):
+            
+               
             if not ("nix_name" in obj.annotations
                     and obj.annotations["nix_name"] in nixblock.multi_tags):
                 # the following restriction could be relaxed later
@@ -821,6 +893,10 @@ class NixIO(BaseIO):
         # save channel views
         for chview in neo_group.channelviews:
             self._write_channelview(chview, nixblock, nixgroup)
+            
+        # save regionofinterests - polygons only
+        for roi in neo_group.regionofinterests:
+            self._write_regionofinterest(roi, nixblock, nixgroup)
 
         # save sub-groups
         for subgroup in neo_group.groups:
